@@ -1,68 +1,114 @@
 package com.Distributedsystem.DFSS.algorithms;
 
-import org.springframework.beans.factory.annotation.Value;
+import com.Distributedsystem.DFSS.entity.FilePart;
+import com.Distributedsystem.DFSS.repository.FilePartRepository;
 import org.springframework.stereotype.Service;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 @Service
 public class MergeAlgorithm {
 
-    @Value("${total.nodes}")
-    private int TOTAL_NODES;
+    private final FilePartRepository filePartRepository;
 
-    public void mergeFiles(int totalParts, String outputFilePath, int fileId) throws IOException {
-        File outputFile = new File(outputFilePath);
-        if (outputFile.getParentFile() != null) {
-            outputFile.getParentFile().mkdirs();
-        }
-        try (BufferedOutputStream out =
-                     new BufferedOutputStream(new FileOutputStream(outputFile))) {
-            for (int part = 1; part <= totalParts; part++) {
-                File chunk = findPart(part, fileId);
+    public MergeAlgorithm(FilePartRepository filePartRepository) {
+        this.filePartRepository = filePartRepository;
+    }
 
-                try (BufferedInputStream in =
-                             new BufferedInputStream(new FileInputStream(chunk))) {
+    /**
+     * Stream a reconstructed file to the caller. The servlet output stream remains owned by
+     * Spring, so this method flushes but does not close it.
+     */
+    public void writeTo(int totalParts, int fileId, OutputStream target) throws IOException {
+        Map<Integer, List<FilePart>> partsByNumber = loadParts(fileId);
+        byte[] copyBuffer = new byte[64 * 1024];
+        OutputStream out = new BufferedOutputStream(target);
 
-                    byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while ((bytesRead = in.read(buffer)) != -1) {
-                        out.write(buffer, 0, bytesRead);
+        for (int partNumber = 1; partNumber <= totalParts; partNumber++) {
+            List<FilePart> copies = partsByNumber.get(partNumber);
+            if (copies == null || copies.isEmpty()) {
+                throw new IOException("Metadata missing for chunk " + partNumber
+                        + " of file " + fileId);
+            }
+
+            IOException lastFailure = null;
+            byte[] readableChunk = null;
+            for (FilePart copy : copies.stream()
+                    .sorted(Comparator.comparing(FilePart::getNodeId))
+                    .toList()) {
+                Path chunkPath = Path.of(copy.getPartPath()).toAbsolutePath().normalize();
+                try (InputStream in = new BufferedInputStream(Files.newInputStream(chunkPath));
+                     ByteArrayOutputStream chunkBuffer = new ByteArrayOutputStream()) {
+                    int read;
+                    while ((read = in.read(copyBuffer)) != -1) {
+                        chunkBuffer.write(copyBuffer, 0, read);
                     }
+                    // Buffer each chunk before writing so a mid-read failure cannot corrupt
+                    // the response before the replica is attempted.
+                    readableChunk = chunkBuffer.toByteArray();
+                    break;
+                } catch (IOException exception) {
+                    lastFailure = exception;
                 }
+            }
+
+            if (readableChunk == null) {
+                throw new IOException("No readable replica for chunk " + partNumber
+                        + " of file " + fileId, lastFailure);
+            }
+            // Keep response-write errors separate from source-read errors. A disconnected
+            // client must not trigger a pointless retry against another replica.
+            out.write(readableChunk);
+        }
+        out.flush();
+    }
+
+    /**
+     * Disk-based compatibility method useful for tests and administrative exports.
+     * The final target is replaced only after every chunk has been reconstructed.
+     */
+    public void mergeFiles(int totalParts, String outputFilePath, int fileId) throws IOException {
+        Path output = Path.of(outputFilePath).toAbsolutePath().normalize();
+        if (output.getParent() != null) {
+            Files.createDirectories(output.getParent());
+        }
+        Path temporaryOutput = Files.createTempFile(output.getParent(), "dfss-", ".assembling");
+        boolean completed = false;
+        try {
+            try (OutputStream out = Files.newOutputStream(temporaryOutput,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                writeTo(totalParts, fileId, out);
+            }
+            try {
+                Files.move(temporaryOutput, output, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException exception) {
+                Files.move(temporaryOutput, output, StandardCopyOption.REPLACE_EXISTING);
+            }
+            completed = true;
+        } finally {
+            if (!completed) {
+                Files.deleteIfExists(temporaryOutput);
             }
         }
     }
 
-    private File findPart(int partNumber, int fileId) {
-
-        int primaryNode = ((partNumber - 1) % TOTAL_NODES) + 1;
-
-        int replicaNode = primaryNode + 1;
-        if (replicaNode > TOTAL_NODES) {
-            replicaNode = 1;
-        }
-
-        File primary = new File(
-                "DFSS/Storage/Node" + primaryNode + "/" +
-                        fileId + "-part-" + partNumber
-        );
-
-        if (primary.exists()) {
-            return primary;
-        }
-
-        File replica = new File(
-                "DFSS/Storage/Node" + replicaNode + "/" +
-                        fileId + "-part-" + partNumber
-        );
-
-        if (replica.exists()) {
-            return replica;
-        }
-
-        throw new RuntimeException(
-                "Part " + partNumber + " not found on primary or replica node."
-        );
+    private Map<Integer, List<FilePart>> loadParts(int fileId) {
+        return filePartRepository.findByFileIdOrderByPartNumberAsc(String.valueOf(fileId))
+                .stream()
+                .collect(Collectors.groupingBy(FilePart::getPartNumber));
     }
 }

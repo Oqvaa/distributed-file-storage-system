@@ -1,42 +1,39 @@
 package com.Distributedsystem.DFSS.algorithms;
 
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.Getter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 
 @Service
 public class ChunkAlgorithm {
-    private static final int CHUNK_SIZE = 1024*1024;
-    // For 1 Megabytes( MB )
 
-//    private static final int TOTAL_NODES = 3;
-    @Value("${total.nodes}")
-    private int TOTAL_NODES;
-    private static String outputDir = "/home/frog/Documents/Distributed System/DFSS (1)/DFSS/Storage/Node";
+    @Value("${chunk.size:1048576}")
+    private int chunkSize;
 
+    @Value("${total.nodes:3}")
+    private int totalNodes;
 
-    public class PartInfo {
+    @Value("${storage.nodes.path:./Storage/Node}")
+    private String nodesDirectory;
 
-        private int partNumber;
+    public static class PartInfo {
+        private final int partNumber;
+        private final String primaryNode;
+        private final String replicaNode;
+        private final String primaryPath;
+        private final String replicaPath;
 
-        private String primaryNode;
-        private String replicaNode;
-
-        private String primaryPath;
-        private String replicaPath;
-
-        public PartInfo(int partNumber,
-                        String primaryNode,
-                        String replicaNode,
-                        String primaryPath,
-                        String replicaPath) {
-
+        public PartInfo(int partNumber, String primaryNode, String replicaNode,
+                        String primaryPath, String replicaPath) {
             this.partNumber = partNumber;
             this.primaryNode = primaryNode;
             this.replicaNode = replicaNode;
@@ -44,86 +41,85 @@ public class ChunkAlgorithm {
             this.replicaPath = replicaPath;
         }
 
-        public int getPartNumber() {
-            return partNumber;
+        public int getPartNumber() { return partNumber; }
+        public String getPrimaryNode() { return primaryNode; }
+        public String getReplicaNode() { return replicaNode; }
+        public String getPrimaryPath() { return primaryPath; }
+        public String getReplicaPath() { return replicaPath; }
+    }
+
+    public List<PartInfo> splitFile(Path inputFile, int fileId) throws IOException {
+        if (totalNodes < 2) {
+            throw new IllegalStateException("At least two storage nodes are required for replication.");
+        }
+        if (chunkSize <= 0) {
+            throw new IllegalStateException("chunk.size must be greater than zero.");
         }
 
-        public String getPrimaryNode() {
-            return primaryNode;
+        List<PartInfo> parts = new ArrayList<>();
+        byte[] buffer = new byte[chunkSize];
+        int node = 1;
+        int partNumber = 1;
+        Path nodeRoot = Path.of(nodesDirectory).toAbsolutePath().normalize();
+
+        try (InputStream in = new BufferedInputStream(Files.newInputStream(inputFile))) {
+            int bytesRead;
+            while ((bytesRead = in.read(buffer)) != -1) {
+                int primaryNode = node;
+                int replicaNode = (node % totalNodes) + 1;
+                String fileName = fileId + "-part-" + partNumber;
+
+                Path primaryDir = nodeRoot.resolve("Node" + primaryNode);
+                Path replicaDir = nodeRoot.resolve("Node" + replicaNode);
+                Files.createDirectories(primaryDir);
+                Files.createDirectories(replicaDir);
+
+                Path primaryPath = primaryDir.resolve(fileName);
+                Path replicaPath = replicaDir.resolve(fileName);
+
+                try {
+                    writeChunk(primaryPath, buffer, bytesRead);
+                    writeChunk(replicaPath, buffer, bytesRead);
+                } catch (IOException | RuntimeException failure) {
+                    deleteQuietly(primaryPath, failure);
+                    deleteQuietly(replicaPath, failure);
+                    throw failure;
+                }
+
+                parts.add(new PartInfo(partNumber, "Node" + primaryNode, "Node" + replicaNode,
+                        primaryPath.toString(), replicaPath.toString()));
+
+                node = (node % totalNodes) + 1;
+                partNumber++;
+            }
+        } catch (IOException | RuntimeException failure) {
+            for (PartInfo part : parts) {
+                deleteQuietly(Path.of(part.getPrimaryPath()), failure);
+                deleteQuietly(Path.of(part.getReplicaPath()), failure);
+            }
+            throw failure;
         }
 
-        public String getReplicaNode() {
-            return replicaNode;
-        }
+        return parts;
+    }
 
-        public String getPrimaryPath() {
-            return primaryPath;
-        }
+    public List<PartInfo> splitFile(String inputFile, int fileId) throws IOException {
+        return splitFile(Path.of(inputFile), fileId);
+    }
 
-        public String getReplicaPath() {
-            return replicaPath;
+    private void writeChunk(Path target, byte[] buffer, int length) throws IOException {
+        try (BufferedOutputStream out = new BufferedOutputStream(Files.newOutputStream(
+                target, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING,
+                StandardOpenOption.WRITE))) {
+            out.write(buffer, 0, length);
         }
     }
 
-    public List<PartInfo> splitFile(String inputFile, int id /* String outputDir */) throws IOException {
-        File file = new File(inputFile);
-        try(InputStream in = new FileInputStream(file)){
-            byte[] buffer = new byte[CHUNK_SIZE];
-            int partnumber  = 1;
-            int byteReader = in.read(buffer);
-            int node = 1;
-            List<PartInfo> parts = new ArrayList<>();
-            while (byteReader != -1) {
-
-                // Primary node
-                int primaryNode = node;
-
-                // Replica node
-                int replicaNode = node + 1;
-                if (replicaNode > TOTAL_NODES) {
-                    replicaNode = 1;
-                }
-
-                String primaryDir = outputDir + primaryNode;
-                String replicaDir = outputDir + replicaNode;
-
-                new File(primaryDir).mkdirs();
-                new File(replicaDir).mkdirs();
-
-                String fileName = id + "-part-" + partnumber;
-
-                String primaryPath = primaryDir + "/" + fileName;
-                String replicaPath = replicaDir + "/" + fileName;
-
-                // Write primary copy
-                try (OutputStream out = new FileOutputStream(primaryPath)) {
-                    out.write(buffer, 0, byteReader);
-                }
-
-                // Write replica copy
-                try (OutputStream out = new FileOutputStream(replicaPath)) {
-                    out.write(buffer, 0, byteReader);
-                }
-
-                parts.add(new PartInfo(
-                        partnumber,
-                        "Node" + primaryNode,
-                        "Node" + replicaNode,
-                        primaryPath,
-                        replicaPath
-                ));
-
-                node++;
-                if (node > TOTAL_NODES) {
-                    node = 1;
-                }
-
-                partnumber++;
-                byteReader = in.read(buffer);
-            }
-            return parts;
+    private void deleteQuietly(Path path, Throwable originalFailure) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException cleanupFailure) {
+            originalFailure.addSuppressed(cleanupFailure);
         }
-
-
     }
 }
