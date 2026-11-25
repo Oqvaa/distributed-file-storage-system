@@ -11,5 +11,7 @@ public interface FilePartRepository extends JpaRepository<FilePart, String> {
 
     List<FilePart> findByFileId(String fileId);
 
+    List<FilePart> findByFileIdOrderByPartNumberAsc(String fileId);
+
     void deleteByFileId(String fileId);
 }

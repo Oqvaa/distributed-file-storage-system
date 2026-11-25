@@ -5,45 +5,38 @@ import com.Distributedsystem.DFSS.entity.FilePart;
 import com.Distributedsystem.DFSS.repository.FilePartRepository;
 import com.Distributedsystem.DFSS.repository.FileRepository;
 import jakarta.transaction.Transactional;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.List;
 
 @Service
 public class FileService {
 
-    @Autowired
-    private FileRepository fileRepository;
+    private final FileRepository fileRepository;
+    private final FilePartRepository filePartRepository;
 
-    @Autowired
-    private FilePartRepository filePartRepository;
+    public FileService(FileRepository fileRepository, FilePartRepository filePartRepository) {
+        this.fileRepository = fileRepository;
+        this.filePartRepository = filePartRepository;
+    }
 
     @Transactional
     public void deleteFile(Integer fileId) throws IOException {
-
         FileEntity file = fileRepository.findById(fileId)
-                .orElseThrow(() -> new RuntimeException("File not found"));
+                .orElseThrow(() -> new IllegalArgumentException("File not found: " + fileId));
 
         List<FilePart> parts = filePartRepository.findByFileId(String.valueOf(fileId));
 
-        // Delete physical chunk files
+        // Remove metadata only after all physical copies have been removed successfully.
         for (FilePart part : parts) {
-            Path path = Paths.get(part.getPartPath());
-            if (Files.exists(path)) {
-                Files.delete(path);
-                System.out.println("Deleted: " + path);
-            }
+            Path path = Path.of(part.getPartPath()).toAbsolutePath().normalize();
+            Files.deleteIfExists(path);
         }
 
-        // Delete chunk records
-        filePartRepository.deleteAll(parts);
-
-        // Delete file metadata
+        filePartRepository.deleteAllInBatch(parts);
         fileRepository.delete(file);
     }
 }

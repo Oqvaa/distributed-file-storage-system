@@ -9,205 +9,208 @@ import com.Distributedsystem.DFSS.entity.StorageNode;
 import com.Distributedsystem.DFSS.repository.FilePartRepository;
 import com.Distributedsystem.DFSS.repository.FileRepository;
 import com.Distributedsystem.DFSS.repository.StorageNodeRepository;
-import org.springframework.core.io.Resource;
-import org.springframework.core.io.UrlResource;
-import org.apache.coyote.Response;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ContentDisposition;
 import org.springframework.http.MediaType;
+import org.springframework.http.MediaTypeFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 
 @RestController
 @RequestMapping("/api/files")
 public class FileController {
 
+    private final ChunkAlgorithm chunkAlgorithm;
+    private final FilePartRepository filePartRepository;
+    private final MergeAlgorithm mergeAlgorithm;
+    private final FileRepository fileRepository;
+    private final FileService fileService;
+    private final StorageNodeRepository storageNodeRepository;
+    private final Path outputDirectory;
 
-    private static final int CHUNK_SIZE = 1024*1024;
-
-
-    @Autowired
-    private ChunkAlgorithm chunkAlgorithm;
-
-    @Autowired
-    private FilePartRepository filePartRepository;
-
-    @Autowired
-    private MergeAlgorithm mergeAlgorithm;
-
-    @Autowired
-    private FileRepository fileRepository;
-
-    @Autowired
-    private FileService fileService;
-
-
-    @Value("${storage.path}")
-    private String STORAGE_DIR   ;
-
-    @Value("${total.nodes}")
-    private int TOTAL_NODES;
-    private static int id = 1;
+    public FileController(ChunkAlgorithm chunkAlgorithm,
+                          FilePartRepository filePartRepository,
+                          MergeAlgorithm mergeAlgorithm,
+                          FileRepository fileRepository,
+                          FileService fileService,
+                          StorageNodeRepository storageNodeRepository,
+                          @Value("${storage.path}") String storageDirectory) {
+        this.chunkAlgorithm = chunkAlgorithm;
+        this.filePartRepository = filePartRepository;
+        this.mergeAlgorithm = mergeAlgorithm;
+        this.fileRepository = fileRepository;
+        this.fileService = fileService;
+        this.storageNodeRepository = storageNodeRepository;
+        this.outputDirectory = Paths.get(storageDirectory).toAbsolutePath().normalize();
+    }
 
     @PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<?> uploadfile(@RequestParam("file") MultipartFile file) {
-
-        if (file.isEmpty()) {
-            return ResponseEntity.badRequest().body("Please select a file to upload.");
+    public ResponseEntity<String> uploadFile(@RequestParam("file") MultipartFile file) {
+        if (file == null || file.isEmpty()) {
+            return ResponseEntity.badRequest().body("Please select a non-empty file to upload.");
         }
+
+        Path temporaryUpload = null;
+        FileEntity savedFile = null;
+        List<ChunkAlgorithm.PartInfo> createdParts = List.of();
 
         try {
+            Files.createDirectories(outputDirectory);
+            String originalFileName = sanitizeFileName(file.getOriginalFilename());
+            temporaryUpload = Files.createTempFile(outputDirectory, "dfss-upload-", ".tmp");
+            file.transferTo(temporaryUpload);
 
-            // Create storage directory if it doesn't exist
-            File dir = new File(STORAGE_DIR);
-            if (!dir.exists()) {
-                dir.mkdirs();
-            }
-
-            // Save uploaded file temporarily
-            String originalFileName = file.getOriginalFilename();
-            File destinationFile = new File(STORAGE_DIR + originalFileName);
-            file.transferTo(destinationFile);
-
-            System.out.println("File uploaded successfully.");
-
-            int fileId = id++;
-
-            // Split file
-            List<ChunkAlgorithm.PartInfo> parts =
-                    chunkAlgorithm.splitFile(STORAGE_DIR + originalFileName, fileId);
-
-            // Save file metadata
             FileEntity fileEntity = new FileEntity();
-            fileEntity.setId(fileId);
             fileEntity.setFileName(originalFileName);
-            fileEntity.setFileSize(destinationFile.length());
+            fileEntity.setFileSize(file.getSize());
+            fileEntity.setTotalParts(0);
             fileEntity.setUploadedAt(LocalDateTime.now());
 
-            int totalParts = parts.size();
-            fileEntity.setTotalParts(totalParts);
+            // The database sequence gives each upload a unique ID, including concurrent uploads.
+            savedFile = fileRepository.saveAndFlush(fileEntity);
+            int fileId = savedFile.getId();
 
-            fileRepository.save(fileEntity);
+            createdParts = chunkAlgorithm.splitFile(temporaryUpload, fileId);
 
-            // Save every chunk into file_parts table
-            for (ChunkAlgorithm.PartInfo part : parts) {
-
-                // Save primary copy
-                FilePart primary = new FilePart();
-                primary.setId(java.util.UUID.randomUUID().toString());
-                primary.setFileId(String.valueOf(fileId));
-                primary.setPartNumber(part.getPartNumber());
-                primary.setNodeId(part.getPrimaryNode());
-                primary.setPartPath(part.getPrimaryPath());
-
-                filePartRepository.save(primary);
-
-                // Save replica copy
-                FilePart replica = new FilePart();
-                replica.setId(java.util.UUID.randomUUID().toString());
-                replica.setFileId(String.valueOf(fileId));
-                replica.setPartNumber(part.getPartNumber());
-                replica.setNodeId(part.getReplicaNode());
-                replica.setPartPath(part.getReplicaPath());
-
-                filePartRepository.save(replica);
+            List<FilePart> records = new ArrayList<>(createdParts.size() * 2);
+            for (ChunkAlgorithm.PartInfo part : createdParts) {
+                records.add(toFilePart(fileId, part.getPartNumber(), part.getPrimaryNode(),
+                        part.getPrimaryPath()));
+                records.add(toFilePart(fileId, part.getPartNumber(), part.getReplicaNode(),
+                        part.getReplicaPath()));
             }
 
-            // Delete temporary uploaded file
-            Files.delete(Paths.get(STORAGE_DIR + originalFileName));
+            filePartRepository.saveAll(records);
+            savedFile.setTotalParts(createdParts.size());
+            fileRepository.save(savedFile);
 
-            return ResponseEntity.ok("File uploaded successfully: " + originalFileName);
-
-        } catch (IOException e) {
-            return ResponseEntity.status(500)
-                    .body("Failed to upload file: " + e.getMessage());
+            return ResponseEntity.ok("File uploaded successfully: " + originalFileName
+                    + " (id=" + fileId + ", chunks=" + createdParts.size() + ")");
+        } catch (IOException | RuntimeException exception) {
+            cleanupUpload(temporaryUpload, createdParts, savedFile);
+            return ResponseEntity.internalServerError()
+                    .body("Failed to upload file: " + exception.getMessage());
+        } finally {
+            if (temporaryUpload != null) {
+                deleteQuietly(temporaryUpload);
+            }
         }
     }
 
+    private FilePart toFilePart(int fileId, int partNumber, String nodeId, String partPath) {
+        FilePart part = new FilePart();
+        part.setId(java.util.UUID.randomUUID().toString());
+        part.setFileId(String.valueOf(fileId));
+        part.setPartNumber(partNumber);
+        part.setNodeId(nodeId);
+        part.setPartPath(partPath);
+        return part;
+    }
 
-    //Download
+    private void cleanupUpload(Path temporaryUpload,
+                               List<ChunkAlgorithm.PartInfo> createdParts,
+                               FileEntity savedFile) {
+        for (ChunkAlgorithm.PartInfo part : createdParts) {
+            deleteQuietly(Path.of(part.getPrimaryPath()));
+            deleteQuietly(Path.of(part.getReplicaPath()));
+        }
+
+        if (savedFile != null && savedFile.getId() != null) {
+            try {
+                filePartRepository.deleteByFileId(String.valueOf(savedFile.getId()));
+                fileRepository.deleteById(savedFile.getId());
+            } catch (RuntimeException ignored) {
+                // Preserve the original failure; orphan cleanup can be retried operationally.
+            }
+        }
+        if (temporaryUpload != null) {
+            deleteQuietly(temporaryUpload);
+        }
+    }
+
+    private void deleteQuietly(Path path) {
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
+            // Best-effort cleanup.
+        }
+    }
+
+    private String sanitizeFileName(String suppliedName) {
+        if (suppliedName == null || suppliedName.isBlank()) {
+            return "uploaded-file";
+        }
+        String normalized = suppliedName.replace('\\', '/');
+        Path suppliedPath = Path.of(normalized);
+        Path fileNamePath = suppliedPath.getFileName();
+        if (fileNamePath == null) {
+            return "uploaded-file";
+        }
+        String fileName = fileNamePath.toString();
+        if (fileName.isBlank() || fileName.equals(".") || fileName.equals("..")) {
+            return "uploaded-file";
+        }
+        return fileName;
+    }
 
     @GetMapping("/download/{fileId}")
-    public ResponseEntity<Resource> downloadFile(@PathVariable Integer fileId) throws IOException {
-        FileEntity file = fileRepository.findById(fileId)
-                .orElseThrow(() -> new RuntimeException("File not found"));
-
-
-        String outputPath = STORAGE_DIR + File.separator + file.getFileName();
-
-        System.out.println("Total Parts: " + file.getTotalParts());
-        // Merge all chunks
-        mergeAlgorithm.mergeFiles(
-                file.getTotalParts(),
-                outputPath,
-                fileId
-        );
-
-        // Load merged file
-        Path path = Paths.get(outputPath);
-
-        if (!Files.exists(path)) {
-            throw new RuntimeException("Merged file not found");
+    public ResponseEntity<StreamingResponseBody> downloadFile(@PathVariable Integer fileId) {
+        FileEntity file = fileRepository.findById(fileId).orElse(null);
+        if (file == null) {
+            return ResponseEntity.notFound().build();
         }
 
-        Resource resource = new UrlResource(path.toUri());
-
-        String contentType = Files.probeContentType(path);
-        if (contentType == null) {
-            contentType = MediaType.APPLICATION_OCTET_STREAM_VALUE;
-        }
+        StreamingResponseBody responseBody = outputStream ->
+                mergeAlgorithm.writeTo(file.getTotalParts(), fileId, outputStream);
+        MediaType contentType = MediaTypeFactory.getMediaType(file.getFileName())
+                .orElse(MediaType.APPLICATION_OCTET_STREAM);
 
         return ResponseEntity.ok()
-                .contentType(MediaType.parseMediaType(contentType))
-                .header("Content-Disposition",
-                        "attachment; filename=\"" + file.getFileName() + "\"")
-                .contentLength(Files.size(path))
-                .body(resource);
+                .contentType(contentType)
+                .contentLength(file.getFileSize())
+                .header("Content-Disposition", ContentDisposition.attachment()
+                        .filename(file.getFileName(), StandardCharsets.UTF_8).build().toString())
+                .body(responseBody);
     }
-
-
-
-    //
 
     @GetMapping
     public List<FileEntity> getAllFiles() {
         return fileRepository.findAll();
     }
 
-
     @DeleteMapping("/{fileId}")
     public ResponseEntity<String> deleteFile(@PathVariable Integer fileId) {
         try {
             fileService.deleteFile(fileId);
             return ResponseEntity.ok("File deleted successfully.");
-        } catch (IOException e) {
-            return ResponseEntity.internalServerError().body("Failed to delete file.");
+        } catch (IllegalArgumentException exception) {
+            return ResponseEntity.notFound().build();
+        } catch (IOException exception) {
+            return ResponseEntity.internalServerError()
+                    .body("Failed to delete file: " + exception.getMessage());
         }
     }
 
     @GetMapping("/{id}")
     public ResponseEntity<FileEntity> getFileById(@PathVariable Integer id) {
-
         return fileRepository.findById(id)
                 .map(ResponseEntity::ok)
                 .orElse(ResponseEntity.notFound().build());
     }
-
-    @Autowired
-    private StorageNodeRepository storageNodeRepository;
 
     @GetMapping("/nodes")
     public List<StorageNode> getAllNodes() {
         return storageNodeRepository.findAll();
     }
 }
-
