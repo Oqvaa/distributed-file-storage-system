@@ -152,7 +152,12 @@ public class FileController {
             return "uploaded-file";
         }
         String normalized = suppliedName.replace('\\', '/');
-        String fileName = Path.of(normalized).getFileName().toString();
+        Path suppliedPath = Path.of(normalized);
+        Path fileNamePath = suppliedPath.getFileName();
+        if (fileNamePath == null) {
+            return "uploaded-file";
+        }
+        String fileName = fileNamePath.toString();
         if (fileName.isBlank() || fileName.equals(".") || fileName.equals("..")) {
             return "uploaded-file";
         }
